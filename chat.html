@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Battery Health Chatbot</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="app-shell">
+    <div class="card">
+        <h1 class="app-title">Battery Health Chatbot</h1>
+        <p class="app-subtitle">
+            Chat with an assistant to understand your battery. 
+            Type <strong>"predict soh"</strong> or <strong>"battery health"</strong> to start a diagnosis.
+        </p>
+
+        <div class="chat-wrapper">
+            <div class="chat-window" id="chat-window">
+                {% if not history %}
+                    <p class="message message-bot">
+                        <span class="message-bubble">
+                            Hi! I can help you estimate battery SOH or answer general questions.
+                            Say <strong>predict soh</strong> to begin a health check.
+                        </span>
+                    </p>
+                {% else %}
+                    {% for role, msg in history %}
+                        <div class="message {% if role == 'user' %}message-user{% else %}message-bot{% endif %}">
+                            <div class="message-bubble">
+                                {{ msg | safe }}
+                            </div>
+                            <div class="message-meta">
+                                {{ 'You' if role == 'user' else 'Bot' }}
+                            </div>
+                        </div>
+                    {% endfor %}
+                {% endif %}
+            </div>
+
+            <form method="post" class="chat-input-row">
+                <input type="text" name="message" placeholder="Type your message..." autofocus>
+                <button type="submit" name="action" value="send">Send</button>
+                <button type="submit" name="action" value="reset">New chat</button>
+            </form>    
+        </div>
+
+        <div class="footer-link">
+            Need manual control? 
+            <a href="{{ url_for('index') }}">Use the form-based SOH predictor</a>
+        </div>
+    </div>
+</div>
+
+<script>
+  // Auto-scroll chat window to the latest message on each load
+  const chatWindow = document.getElementById('chat-window');
+  if (chatWindow) {
+      chatWindow.scrollTop = chatWindow.scrollHeight;
+  }
+</script>
+</body>
+</html>
