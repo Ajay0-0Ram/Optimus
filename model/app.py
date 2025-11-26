@@ -86,13 +86,69 @@ def format_bot_text(text: str) -> str:
     # new lines -> <br>
     text = text.replace("\n", "<br>")
     return text
+#used to detect if the user sends a simple greeting prompt
+#added cancelltion of input handler
+def detect_simple_intent(text: str) -> str:
+    """Return a simple intent label: help, greeting, goodbye, thanks, or none."""
+    t = text.lower().strip()
+
+    # Help intent
+    help_phrases = [
+        "help",
+        "what can you do",
+        "how does this work",
+        "what do you do",
+        "instructions",
+        "how to use",
+    ]
+    if any(p in t for p in help_phrases):
+        return "help"
+
+    # Greeting
+    greetings = ["hi", "hello", "hey", "yo", "sup", "good morning", "good evening"]
+    if any(t.startswith(g) for g in greetings):
+        return "greeting"
+
+    # Goodbye
+    goodbyes = ["bye", "goodbye", "see you", "later", "good night"]
+    if any(p in t for p in goodbyes):
+        return "goodbye"
+
+    # Thanks
+    if "thank you" in t or "thanks" in t or "thx" in t:
+        return "thanks"
+    
+    # CANCEL intent
+    cancel_phrases = ["cancel", "stop", "nevermind", "never mind", "forget it"]
+    if any(p == t or p in t for p in cancel_phrases):
+        return "cancel"
+
+    # CORRECTION intent (user made a mistake)
+    correction_phrases = [
+        "wait no", "that was wrong", "restart", "oops",
+        "let me try again", "i want to redo", "redo", "start over"
+    ]
+    if any(p in t for p in correction_phrases):
+        return "correction"
+
+    return "none"
 
 
 # ==========================
 #        FLASK APP
 # ==========================
 
-app = Flask(__name__)
+# app = Flask(__name__)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(BASE_DIR)  # one level up
+
+app = Flask(
+    __name__,
+    template_folder=os.path.join(ROOT_DIR, "templates"),
+    static_folder=os.path.join(ROOT_DIR, "static"),
+)
+
 app.secret_key = "change-this-to-a-random-secret"  # needed for session
 
 
@@ -134,6 +190,223 @@ def index():
 # ==========================
 
 @app.route("/chatbot", methods=["GET", "POST"])
+# def chatbot():
+
+#     # simple session-based state
+#     if "history" not in session:
+#         session["history"] = []
+#     if "mode" not in session:
+#         session["mode"] = "normal"   # normal / await_voltages / await_soc / await_soe
+#     if "soh_data" not in session:
+#         session["soh_data"] = {}
+
+#     history = session["history"]
+#     mode = session["mode"]
+#     soh_data = session["soh_data"]
+
+#     bot_reply = None
+
+#     if request.method == "POST":
+#         action = request.form.get("action", "send")
+
+#         # --- Handle "New chat" button ---
+#         if action == "reset":
+#             history = []
+#             mode = "normal"
+#             soh_data = {}
+#             bot_reply = format_bot_text("Starting a new conversation. How can I help you?")
+#             history.append(("bot", bot_reply))
+
+#             session["history"] = history
+#             session["mode"] = mode
+#             session["soh_data"] = soh_data
+
+#             return render_template("chat.html", history=history)
+
+#         # Otherwise, normal send
+#         user_msg = request.form.get("message", "").strip()
+#         if user_msg:
+#             history.append(("user", user_msg))
+
+#             # ---------- SIMPLE INTENT HANDLING (HELP + SMALL TALK) ----------
+#             intent = detect_simple_intent(user_msg)
+            
+#             # ---------- CANCEL INTENT ----------
+#             if intent == "cancel":
+#                 # Reset the flow but keep history
+#                 mode = "normal"
+#                 soh_data = {}
+#                 bot_reply = format_bot_text(
+#                     "Okay, I’ve cancelled the current SOH check.\n"
+#                     "If you'd like to start again, just say **'predict SOH'**."
+#                 )
+
+#             # ---------- CORRECTION INTENT ----------
+#             elif intent == "correction":
+#                 # Restart SOH flow completely
+#                 mode = "await_voltages"
+#                 soh_data = {}
+
+#                 bot_reply = format_bot_text(
+#                     "No problem — let's restart the SOH check.\n"
+#                     "Please enter your 21 voltages again (U1–U21 separated by spaces)."
+#                 )
+
+#             elif intent == "help":
+#                 bot_reply = format_bot_text(
+#                     "**Here’s how I can help you:**\n"
+#                     "- Predict your battery State of Health (SOH)\n"
+#                     "- Explain what SOH, SOC, and SOE mean in simple terms\n"
+#                     "- Walk you through entering voltages step by step\n"
+#                     "- Chat about battery basics or general questions\n\n"
+#                     "If you’d like to check your battery, type something like "
+#                     "**'predict SOH'** or **'check battery health'**."
+#                 )
+
+#             elif intent == "greeting":
+#                 bot_reply = format_bot_text(
+#                     "Hey! 👋\n\n"
+#                     "I’m your battery assistant.\n"
+#                     "You can say **'predict SOH'** or **check battery health** to start a battery health check, "
+#                     "or ask **'help'** to see what I can do."
+#                 )
+
+#             elif intent == "goodbye":
+#                 bot_reply = format_bot_text(
+#                     "Goodbye! 👋\n"
+#                     "Come back anytime you want to check your battery health."
+#                 )
+
+#             elif intent == "thanks":
+#                 bot_reply = format_bot_text(
+#                     "You’re welcome! 😊\n"
+#                     "If you want another check later, just say **'predict SOH'**."
+#                 )
+
+#             # --------- STATE MACHINE ----------
+#             # 1) If in normal mode and user asks for prediction
+#             if mode == "normal" and (
+#                 "predict soh" in user_msg.lower()
+#                 or "check battery health" in user_msg.lower()
+#             ):
+#                 mode = "await_voltages"
+#                 soh_data = {}
+#                 bot_reply = (
+#                     "Okay, let's check your battery health.\n"
+#                     "Please send 21 cell voltages (U1–U21) in one line, "
+#                     "separated by spaces."
+#                 )
+#                 bot_reply = format_bot_text(bot_reply)
+
+#             # 2) Collect voltages
+#             elif mode == "await_voltages":
+#                 try:
+#                     parts = user_msg.split()
+#                     U_values = [float(x) for x in parts]
+#                     if len(U_values) != 21:
+#                         raise ValueError
+#                     soh_data["U_values"] = U_values
+#                     mode = "await_soc"
+#                     bot_reply = "Got the voltages. Now enter SOC (as a number)."
+#                     bot_reply = format_bot_text(bot_reply)
+#                 except ValueError:
+#                     bot_reply = (
+#                         "I couldn't read that as 21 numbers.\n"
+#                         "Please enter exactly 21 numeric voltages separated by spaces."
+#                     )
+#                     bot_reply = format_bot_text(bot_reply)
+
+#             # 3) Collect SOC
+#             elif mode == "await_soc":
+#                 try:
+#                     soc = float(user_msg)
+#                     soh_data["soc"] = soc
+#                     mode = "await_soe"
+#                     bot_reply = "Thanks. Now enter SOE (as a number)."
+#                     bot_reply = format_bot_text(bot_reply)
+#                 except ValueError:
+#                     bot_reply = "Please enter SOC as a numeric value."
+#                     bot_reply = format_bot_text(bot_reply)
+
+#             # 4) Collect SOE and run prediction
+#             elif mode == "await_soe":
+#                 try:
+#                     soe = float(user_msg)
+#                     soh_data["soe"] = soe
+
+#                     U_values = soh_data["U_values"]
+#                     soc = soh_data["soc"]
+
+#                     soh = predict_soh(U_values, soc, soe)
+#                     status = "Healthy" if soh >= 0.8 else "Has a Problem"
+
+#                     # Ask Gemini to explain the result
+#                     explanation_prompt = (
+#                         f"The predicted battery SOH is {soh:.4f} and the status is '{status}'. "
+#                         "Explain what this means in simple terms for a non-expert user."
+#                     )
+#                     contents = [
+#                         types.Content(
+#                             role="user",
+#                             parts=[types.Part(text=explanation_prompt)]
+#                         )
+#                     ]
+
+#                     chunks = []
+#                     for chunk in client.models.generate_content_stream(
+#                         model=GEMINI_MODEL,
+#                         contents=contents,
+#                         config=types.GenerateContentConfig()
+#                     ):
+#                         if chunk.text:
+#                             chunks.append(chunk.text)
+#                     explanation = "".join(chunks)
+
+#                     bot_reply_raw = (
+#                         f"Predicted SOH: {soh:.4f}\n"
+#                         f"Battery Status: {status}\n\n"
+#                         f"{explanation}"
+#                     )
+#                     bot_reply = format_bot_text(bot_reply_raw)
+
+#                     # reset state back to normal
+#                     mode = "normal"
+#                     soh_data = {}
+
+#                 except ValueError:
+#                     bot_reply = "Please enter SOE as a numeric value."
+#                     bot_reply = format_bot_text(bot_reply)
+
+#             # 5) Normal chat mode → forward to Gemini
+#             elif mode == "normal":
+#                 contents = [
+#                     types.Content(
+#                         role="user",
+#                         parts=[types.Part(text=user_msg)]
+#                     )
+#                 ]
+#                 chunks = []
+#                 for chunk in client.models.generate_content_stream(
+#                     model=GEMINI_MODEL,
+#                     contents=contents,
+#                     config=types.GenerateContentConfig()
+#                 ):
+#                     if chunk.text:
+#                         chunks.append(chunk.text)
+#                 bot_reply = format_bot_text("".join(chunks))
+
+#             # ---------------------------------
+
+#             if bot_reply:
+#                 history.append(("bot", bot_reply))
+
+#             # store back in session
+#             session["history"] = history
+#             session["mode"] = mode
+#             session["soh_data"] = soh_data
+
+#     return render_template("chat.html", history=history)
+@app.route("/chatbot", methods=["GET", "POST"])
 def chatbot():
     # simple session-based state
     if "history" not in session:
@@ -171,11 +444,76 @@ def chatbot():
         if user_msg:
             history.append(("user", user_msg))
 
+            # ---------- SIMPLE INTENT HANDLING (HELP + SMALL TALK + CANCEL + CORRECTION) ----------
+            intent = detect_simple_intent(user_msg)
+
+            # CANCEL INTENT
+            if intent == "cancel":
+                # Reset the flow but keep history
+                mode = "normal"
+                soh_data = {}
+                bot_reply = format_bot_text(
+                    "Okay, I’ve cancelled the current SOH check.\n"
+                    "If you'd like to start again, just say **'predict SOH'**."
+                )
+
+            # CORRECTION INTENT
+            elif intent == "correction":
+                # Restart SOH flow completely
+                mode = "await_voltages"
+                soh_data = {}
+                bot_reply = format_bot_text(
+                    "No problem — let's restart the SOH check.\n"
+                    "Please enter your 21 voltages again (U1–U21 separated by spaces)."
+                )
+
+            elif intent == "help":
+                #give help statements
+                bot_reply = format_bot_text(
+                    "**Here’s how I can help you:**\n"
+                    "- Predict your battery State of Health (SOH)\n"
+                    "- Explain what SOH, SOC, and SOE mean in simple terms\n"
+                    "- Walk you through entering voltages step by step\n"
+                    "- Chat about battery basics or general questions\n\n"
+                    "If you’d like to check your battery, type something like "
+                    "**'predict SOH'** or **'check battery health'**."
+                )
+
+            elif intent == "greeting":
+                #replies with the greeting statement
+                bot_reply = format_bot_text(
+                    "Hey! 👋\n\n"
+                    "I’m your battery assistant.\n"
+                    "You can say **'predict SOH'** or **'check battery health'** to start a battery health check, "
+                    "or ask **'help'** to see what I can do."
+                )
+
+            elif intent == "goodbye":
+                #rpelies with the bye statements
+                bot_reply = format_bot_text(
+                    "Goodbye! 👋\n"
+                    "Come back anytime you want to check your battery health."
+                )
+
+            elif intent == "thanks":
+                bot_reply = format_bot_text(
+                    "You’re welcome! 😊\n"
+                    "If you want another check later, just say **'predict SOH'**."
+                )
+
+            # If any simple intent produced a reply, send it and SKIP the rest
+            if bot_reply:
+                history.append(("bot", bot_reply))
+                session["history"] = history
+                session["mode"] = mode
+                session["soh_data"] = soh_data
+                return render_template("chat.html", history=history)
+
             # --------- STATE MACHINE ----------
             # 1) If in normal mode and user asks for prediction
             if mode == "normal" and (
                 "predict soh" in user_msg.lower()
-                or "battery health" in user_msg.lower()
+                or "check battery health" in user_msg.lower()
             ):
                 mode = "await_voltages"
                 soh_data = {}
