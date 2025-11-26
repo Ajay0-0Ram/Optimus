@@ -1,28 +1,27 @@
-Prerequisites:
+**Prerequisites:**  
 Python 3.10 or higher
 VS Code (recommended) with the Python extension
 
-Installation (VS Code):
+**Installation (VS Code):**  
 Open the project folder in VS Code.
 
-Create a virtual environment (recommended):
-Windows (PowerShell) - paste each one by one into terminal  
+**Create a virtual environment (recommended):**  
+**Windows (PowerShell) - paste each one by one into terminal**  
 python -m venv .venv  
 .venv\Scripts\Activate.ps1
 
-macOS / Linux - paste each one by one into terminal  
+**macOS / Linux - paste each one by one into terminal**  
 python3 -m venv .venv  
 source .venv/bin/activate
 
-Select the virtual environment in VS Code:  
+**Select the virtual environment in VS Code:**  
 Ctrl+Shift+P → “Python: Select Interpreter” → choose .venv.
 
-Install Dependencies:  
-pip install pandas numpy scikit-learn matplotlib pyarrow flask python-dotenv google-genai
-
+**Install Dependencies:**  
+pip install pandas numpy scikit-learn matplotlib pyarrow flask python-dotenv google-genai  
 pyarrow is required to read the Feather file format.
 
-How to Run:
+**How to Run:**  
 Make sure main.py, app.py and PulseBat.feather are in the same directory, then:
 python main.py -> regular prediction model through the terminal
 python app.py -> flask generated chatbot and prediction form
@@ -32,12 +31,12 @@ Cross-validation R² scores (leak check)
 Test set metrics (R², MSE, MAE)
 Interactive CLI for SOH prediction
 
-Troubleshooting
+**Troubleshooting**  
 ModuleNotFoundError → Re-activate your venv and reinstall dependencies.
 Feather read error → Ensure PulseBat.feather is in the same folder as main.py.
 Wrong interpreter → Ctrl+Shift+P → “Python: Select Interpreter” → pick .venv.
 
-What the Script Does:
+**What the Script Does:**  
 Load Data (PulseBat.feather
 Sort by SOC (ascending) to keep train/test consistent.
 Split data (80/20) without shuffling.
