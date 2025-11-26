@@ -6,18 +6,18 @@ Installation (VS Code):
 Open the project folder in VS Code.
 
 Create a virtual environment (recommended):
-Windows (PowerShell) - paste each one by one into terminal
-python -m venv .venv
+Windows (PowerShell) - paste each one by one into terminal  
+python -m venv .venv  
 .venv\Scripts\Activate.ps1
 
-macOS / Linux - paste each one by one into terminal
-python3 -m venv .venv
+macOS / Linux - paste each one by one into terminal  
+python3 -m venv .venv  
 source .venv/bin/activate
 
-Select the virtual environment in VS Code:
+Select the virtual environment in VS Code:  
 Ctrl+Shift+P → “Python: Select Interpreter” → choose .venv.
 
-Install Dependencies:
+Install Dependencies:  
 pip install pandas numpy scikit-learn matplotlib pyarrow flask python-dotenv google-genai
 
 pyarrow is required to read the Feather file format.
