@@ -1,42 +1,74 @@
 import os
-import re  # 👈 for formatting helper
 import numpy as np
 import pandas as pd
 
 from flask import Flask, render_template, request, session
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+
 from dotenv import load_dotenv
+
 from google import genai
 from google.genai import types
 
-from sklearn.model_selection import train_test_split, KFold, cross_val_score
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.pipeline import Pipeline
 
-# ==========================
-#   LOAD ENV + GEMINI CLIENT
-# ==========================
+# ---------------------------
+# Paths & Flask app setup
+# ---------------------------
+
+# BASE_DIR = folder where app.py lives (Optimus/model)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ROOT_DIR = project root (Optimus)
+ROOT_DIR = os.path.dirname(BASE_DIR)
+
+TEMPLATE_DIR = os.path.join(ROOT_DIR, "templates")
+STATIC_DIR = os.path.join(ROOT_DIR, "static")
+
+# Tell Flask exactly where templates and static live
+app = Flask(__name__, template_folder=TEMPLATE_DIR, static_folder=STATIC_DIR)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-key")
+
+
+# ---------------------------
+# Environment & Gemini setup
+# ---------------------------
 
 load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is not set in the .env file")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
 GEMINI_MODEL = "gemini-2.0-flash"
 
-# ==========================
-#   TRAIN MODEL ON STARTUP
-# ==========================
+
+# ---------------------------
+# Load data & train models
+# ---------------------------
 
 print("[SOH MODEL] Training model...")
 
-data = pd.read_feather("PulseBat.feather")
+DATA_PATH = os.path.join(BASE_DIR, "PulseBat.feather")
+
+data = pd.read_feather(DATA_PATH)
 data = data.sort_values(by="SOC", ascending=True)
 
-model_data = data[['Qn', 'Q', 'SOC', 'SOE'] + [f'U{i}' for i in range(1, 22)] + ['SOH']]
-X = model_data[[f"U{i}" for i in range(1, 22)] + ["SOC", "SOE"]]
+# Features: 21 voltages + SOC + SOE + target SOH
+U_COLS = [f"U{i}" for i in range(1, 22)]
+model_data = data[["Qn", "Q", "SOC", "SOE"] + U_COLS + ["SOH"]]
+
+X = model_data[U_COLS + ["SOC", "SOE"]]
 Y = model_data["SOH"]
 
-X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, shuffle=False)
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.2, shuffle=False
+)
 
-# --- Outlier removal ---
+# --- Outlier removal for main model ---
 _baseline = LinearRegression().fit(X_train, Y_train)
 _resid = Y_train - _baseline.predict(X_train)
 
@@ -52,592 +84,521 @@ else:
 X_train_clean = X_train[keep_mask]
 Y_train_clean = Y_train[keep_mask]
 
-model = Pipeline([
-    ("scaler", StandardScaler()),
-    ("poly", PolynomialFeatures(degree=2, include_bias=False)),
-    ("linreg", LinearRegression())
-])
+# ========= MAIN MODEL (full 21 voltages) =========
+model = Pipeline(
+    [
+        ("scaler", StandardScaler()),
+        ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+        ("linreg", LinearRegression()),
+    ]
+)
 
 cv = KFold(n_splits=5, shuffle=True, random_state=42)
-cv_scores = cross_val_score(model, X, Y, cv=cv, scoring='r2')
-print("[SOH MODEL] CV mean R²:", np.mean(cv_scores))
+cv_scores = cross_val_score(model, X, Y, cv=cv, scoring="r2")
+print("[SOH MODEL] CV mean R² (full features):", np.mean(cv_scores))
 
 model.fit(X_train_clean, Y_train_clean)
-print("[SOH MODEL] Ready.\n")
+print("[SOH MODEL] Full-feature model ready.")
 
+# ========= FALLBACK MODEL (mean(U1..U21) + SOC + SOE) =========
+X_fallback_train = pd.DataFrame(
+    {
+        "U_mean": X_train_clean[U_COLS].mean(axis=1),
+        "SOC": X_train_clean["SOC"],
+        "SOE": X_train_clean["SOE"],
+    }
+)
+
+fallback_model = Pipeline(
+    [
+        ("scaler", StandardScaler()),
+        ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+        ("linreg", LinearRegression()),
+    ]
+)
+
+cv_fallback_scores = cross_val_score(
+    fallback_model, X_fallback_train, Y_train_clean, cv=cv, scoring="r2"
+)
+print("[SOH MODEL] CV mean R² (fallback):", np.mean(cv_fallback_scores))
+
+fallback_model.fit(X_fallback_train, Y_train_clean)
+print("[SOH MODEL] Fallback model ready.\n")
+
+
+# ---------------------------
+# Helper functions
+# ---------------------------
 
 def predict_soh(U_values, soc, soe):
-    """U_values: list of 21 floats; soc, soe: floats"""
-    if len(U_values) != 21:
-        raise ValueError(f"Expected 21 voltages, got {len(U_values)}")
-    vec = np.array(U_values + [soc, soe]).reshape(1, -1)
-    return float(model.predict(vec)[0])
+    """
+    U_values: list of 1–21 floats
+    soc, soe: floats
+
+    Returns:
+        soh (float), used_fallback (bool)
+        used_fallback=True means we used the simpler model.
+    """
+    if not U_values:
+        raise ValueError("At least one voltage value is required.")
+
+    U_values = [float(v) for v in U_values]
+
+    # Full model case: exactly 21 voltages
+    if len(U_values) == 21:
+        vec = np.array(U_values + [soc, soe]).reshape(1, -1)
+        soh = float(model.predict(vec)[0])
+        return soh, False
+
+    # Fallback case: 1–20 voltages
+    mean_u = float(np.mean(U_values))
+    vec_fb = np.array([mean_u, soc, soe]).reshape(1, -1)
+    soh = float(fallback_model.predict(vec_fb)[0])
+    return soh, True
 
 
 def format_bot_text(text: str) -> str:
-    """
-    Convert simple markdown (**bold**) and newlines to HTML
-    so they render nicely in the chat UI.
-    """
-    if not text:
-        return ""
-    # **bold** -> <b>bold</b>
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    # new lines -> <br>
-    text = text.replace("\n", "<br>")
-    return text
-#used to detect if the user sends a simple greeting prompt
-#added cancelltion of input handler
-def detect_simple_intent(text: str) -> str:
-    """Return a simple intent label: help, greeting, goodbye, thanks, or none."""
-    t = text.lower().strip()
+    """Convert newlines to <br> for HTML display."""
+    return text.replace("\n", "<br>")
 
-    # Help intent
-    help_phrases = [
-        "help",
-        "what can you do",
-        "how does this work",
-        "what do you do",
-        "instructions",
-        "how to use",
-    ]
-    if any(p in t for p in help_phrases):
+
+def detect_simple_intent(message: str):
+    """
+    Very lightweight intent detection based on keywords.
+    Returns one of:
+        "help", "greeting", "goodbye", "thanks", "cancel", "restart", None
+    """
+    msg = message.lower().strip()
+
+    if not msg:
+        return None
+
+    # Help
+    if any(word in msg for word in ["help", "what can you do", "how to use"]):
         return "help"
 
-    # Greeting
-    greetings = ["hi", "hello", "hey", "yo", "sup", "good morning", "good evening"]
-    if any(t.startswith(g) for g in greetings):
+    # Greetings
+    if any(word in msg for word in ["hi", "hello", "hey", "good morning", "good evening"]):
         return "greeting"
 
     # Goodbye
-    goodbyes = ["bye", "goodbye", "see you", "later", "good night"]
-    if any(p in t for p in goodbyes):
+    if any(word in msg for word in ["bye", "goodbye", "see you", "good night"]):
         return "goodbye"
 
     # Thanks
-    if "thank you" in t or "thanks" in t or "thx" in t:
+    if any(word in msg for word in ["thanks", "thank you", "thx", "tysm"]):
         return "thanks"
-    
-    # CANCEL intent
-    cancel_phrases = ["cancel", "stop", "nevermind", "never mind", "forget it"]
-    if any(p == t or p in t for p in cancel_phrases):
+
+    # Cancel ongoing flow
+    if any(word in msg for word in ["cancel", "stop", "nevermind", "never mind"]):
         return "cancel"
 
-    # CORRECTION intent (user made a mistake)
-    correction_phrases = [
-        "wait no", "that was wrong", "restart", "oops",
-        "let me try again", "i want to redo", "redo", "start over"
-    ]
-    if any(p in t for p in correction_phrases):
-        return "correction"
+    # Restart / redo
+    if any(
+        word in msg
+        for word in ["restart", "redo", "start over", "reset", "new check", "new test"]
+    ):
+        return "restart"
 
-    return "none"
+    return None
 
 
-# ==========================
-#        FLASK APP
-# ==========================
+def gemini_reply(prompt: str) -> str:
+    """
+    Send a prompt to Gemini and get back a single string.
+    This version avoids Part.from_text and just passes the prompt string.
+    """
+    chunks = []
+    for chunk in client.models.generate_content_stream(
+        model=GEMINI_MODEL,
+        contents=prompt,  # just a plain string
+        config=types.GenerateContentConfig(),
+    ):
+        # Some SDK versions set .text, some use .candidates[0].content.parts[0].text
+        if getattr(chunk, "text", None):
+            chunks.append(chunk.text)
+        elif getattr(chunk, "candidates", None):
+            try:
+                text_part = chunk.candidates[0].content.parts[0].text
+                chunks.append(text_part)
+            except Exception:
+                pass
 
-# app = Flask(__name__)
+    return "".join(chunks)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(BASE_DIR)  # one level up
 
-app = Flask(
-    __name__,
-    template_folder=os.path.join(ROOT_DIR, "templates"),
-    static_folder=os.path.join(ROOT_DIR, "static"),
-)
-
-app.secret_key = "change-this-to-a-random-secret"  # needed for session
-
+# ---------------------------
+# Routes: Manual form
+# ---------------------------
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    """Original form-based UI (optional, keep as backup)."""
+    error = None
     prediction = None
     status = None
-    error = None
+    used_fallback = False
+
+    # Default threshold 0.8 (80%), can be changed by user.
+    threshold = 0.8
 
     if request.method == "POST":
+        # Threshold
+        threshold_str = request.form.get("threshold", "0.8").strip()
+        if threshold_str:
+            try:
+                threshold = float(threshold_str)
+            except ValueError:
+                error = "Threshold must be a numeric value."
+                return render_template(
+                    "index.html",
+                    prediction=prediction,
+                    status=status,
+                    error=error,
+                    threshold=threshold,
+                )
+
+        # SOC & SOE
         try:
-            threshold = float(request.form.get("threshold", "0.8"))
-            soc = float(request.form.get("soc", "0"))
-            soe = float(request.form.get("soe", "0"))
-
-            U_values = []
-            for i in range(1, 22):
-                val = float(request.form.get(f"U{i}", "0"))
-                U_values.append(val)
-
-            soh = predict_soh(U_values, soc, soe)
-            prediction = round(soh, 4)
-            status = "Healthy" if soh >= threshold else "Has a Problem"
-
+            soc_str = request.form.get("soc", "").strip()
+            soe_str = request.form.get("soe", "").strip()
+            soc = float(soc_str)
+            soe = float(soe_str)
         except ValueError:
-            error = "Please enter valid numeric values."
+            error = "Please enter valid numeric values for SOC and SOE."
+            return render_template(
+                "index.html",
+                prediction=prediction,
+                status=status,
+                error=error,
+                threshold=threshold,
+            )
+
+        # Voltages U1..U21 (allow missing ones -> fallback model if <21)
+        U_values = []
+        try:
+            for i in range(1, 22):
+                val_str = request.form.get(f"U{i}", "").strip()
+                if val_str == "":
+                    # Skip empty fields – fallback model will be used if <21
+                    continue
+                U_values.append(float(val_str))
+        except ValueError:
+            error = "Please enter valid numeric values for the voltages."
+            return render_template(
+                "index.html",
+                prediction=prediction,
+                status=status,
+                error=error,
+                threshold=threshold,
+            )
+
+        if not U_values:
+            error = "Please provide at least one voltage value."
+            return render_template(
+                "index.html",
+                prediction=prediction,
+                status=status,
+                error=error,
+                threshold=threshold,
+            )
+
+        try:
+            soh, used_fallback = predict_soh(U_values, soc, soe)
+        except ValueError as e:
+            error = str(e)
+            return render_template(
+                "index.html",
+                prediction=prediction,
+                status=status,
+                error=error,
+                threshold=threshold,
+            )
+
+        prediction = round(soh, 4)
+        status = "Healthy" if soh >= threshold else "Has a Problem"
 
     return render_template(
         "index.html",
         prediction=prediction,
         status=status,
-        error=error
+        error=error,
+        threshold=threshold,
+        used_fallback=used_fallback,
     )
 
 
-# ==========================
-#        CHATBOT ROUTE
-# ==========================
+# ---------------------------
+# Routes: Chatbot
+# ---------------------------
 
-@app.route("/chatbot", methods=["GET", "POST"])
-# def chatbot():
-
-#     # simple session-based state
-#     if "history" not in session:
-#         session["history"] = []
-#     if "mode" not in session:
-#         session["mode"] = "normal"   # normal / await_voltages / await_soc / await_soe
-#     if "soh_data" not in session:
-#         session["soh_data"] = {}
-
-#     history = session["history"]
-#     mode = session["mode"]
-#     soh_data = session["soh_data"]
-
-#     bot_reply = None
-
-#     if request.method == "POST":
-#         action = request.form.get("action", "send")
-
-#         # --- Handle "New chat" button ---
-#         if action == "reset":
-#             history = []
-#             mode = "normal"
-#             soh_data = {}
-#             bot_reply = format_bot_text("Starting a new conversation. How can I help you?")
-#             history.append(("bot", bot_reply))
-
-#             session["history"] = history
-#             session["mode"] = mode
-#             session["soh_data"] = soh_data
-
-#             return render_template("chat.html", history=history)
-
-#         # Otherwise, normal send
-#         user_msg = request.form.get("message", "").strip()
-#         if user_msg:
-#             history.append(("user", user_msg))
-
-#             # ---------- SIMPLE INTENT HANDLING (HELP + SMALL TALK) ----------
-#             intent = detect_simple_intent(user_msg)
-            
-#             # ---------- CANCEL INTENT ----------
-#             if intent == "cancel":
-#                 # Reset the flow but keep history
-#                 mode = "normal"
-#                 soh_data = {}
-#                 bot_reply = format_bot_text(
-#                     "Okay, I’ve cancelled the current SOH check.\n"
-#                     "If you'd like to start again, just say **'predict SOH'**."
-#                 )
-
-#             # ---------- CORRECTION INTENT ----------
-#             elif intent == "correction":
-#                 # Restart SOH flow completely
-#                 mode = "await_voltages"
-#                 soh_data = {}
-
-#                 bot_reply = format_bot_text(
-#                     "No problem — let's restart the SOH check.\n"
-#                     "Please enter your 21 voltages again (U1–U21 separated by spaces)."
-#                 )
-
-#             elif intent == "help":
-#                 bot_reply = format_bot_text(
-#                     "**Here’s how I can help you:**\n"
-#                     "- Predict your battery State of Health (SOH)\n"
-#                     "- Explain what SOH, SOC, and SOE mean in simple terms\n"
-#                     "- Walk you through entering voltages step by step\n"
-#                     "- Chat about battery basics or general questions\n\n"
-#                     "If you’d like to check your battery, type something like "
-#                     "**'predict SOH'** or **'check battery health'**."
-#                 )
-
-#             elif intent == "greeting":
-#                 bot_reply = format_bot_text(
-#                     "Hey! 👋\n\n"
-#                     "I’m your battery assistant.\n"
-#                     "You can say **'predict SOH'** or **check battery health** to start a battery health check, "
-#                     "or ask **'help'** to see what I can do."
-#                 )
-
-#             elif intent == "goodbye":
-#                 bot_reply = format_bot_text(
-#                     "Goodbye! 👋\n"
-#                     "Come back anytime you want to check your battery health."
-#                 )
-
-#             elif intent == "thanks":
-#                 bot_reply = format_bot_text(
-#                     "You’re welcome! 😊\n"
-#                     "If you want another check later, just say **'predict SOH'**."
-#                 )
-
-#             # --------- STATE MACHINE ----------
-#             # 1) If in normal mode and user asks for prediction
-#             if mode == "normal" and (
-#                 "predict soh" in user_msg.lower()
-#                 or "check battery health" in user_msg.lower()
-#             ):
-#                 mode = "await_voltages"
-#                 soh_data = {}
-#                 bot_reply = (
-#                     "Okay, let's check your battery health.\n"
-#                     "Please send 21 cell voltages (U1–U21) in one line, "
-#                     "separated by spaces."
-#                 )
-#                 bot_reply = format_bot_text(bot_reply)
-
-#             # 2) Collect voltages
-#             elif mode == "await_voltages":
-#                 try:
-#                     parts = user_msg.split()
-#                     U_values = [float(x) for x in parts]
-#                     if len(U_values) != 21:
-#                         raise ValueError
-#                     soh_data["U_values"] = U_values
-#                     mode = "await_soc"
-#                     bot_reply = "Got the voltages. Now enter SOC (as a number)."
-#                     bot_reply = format_bot_text(bot_reply)
-#                 except ValueError:
-#                     bot_reply = (
-#                         "I couldn't read that as 21 numbers.\n"
-#                         "Please enter exactly 21 numeric voltages separated by spaces."
-#                     )
-#                     bot_reply = format_bot_text(bot_reply)
-
-#             # 3) Collect SOC
-#             elif mode == "await_soc":
-#                 try:
-#                     soc = float(user_msg)
-#                     soh_data["soc"] = soc
-#                     mode = "await_soe"
-#                     bot_reply = "Thanks. Now enter SOE (as a number)."
-#                     bot_reply = format_bot_text(bot_reply)
-#                 except ValueError:
-#                     bot_reply = "Please enter SOC as a numeric value."
-#                     bot_reply = format_bot_text(bot_reply)
-
-#             # 4) Collect SOE and run prediction
-#             elif mode == "await_soe":
-#                 try:
-#                     soe = float(user_msg)
-#                     soh_data["soe"] = soe
-
-#                     U_values = soh_data["U_values"]
-#                     soc = soh_data["soc"]
-
-#                     soh = predict_soh(U_values, soc, soe)
-#                     status = "Healthy" if soh >= 0.8 else "Has a Problem"
-
-#                     # Ask Gemini to explain the result
-#                     explanation_prompt = (
-#                         f"The predicted battery SOH is {soh:.4f} and the status is '{status}'. "
-#                         "Explain what this means in simple terms for a non-expert user."
-#                     )
-#                     contents = [
-#                         types.Content(
-#                             role="user",
-#                             parts=[types.Part(text=explanation_prompt)]
-#                         )
-#                     ]
-
-#                     chunks = []
-#                     for chunk in client.models.generate_content_stream(
-#                         model=GEMINI_MODEL,
-#                         contents=contents,
-#                         config=types.GenerateContentConfig()
-#                     ):
-#                         if chunk.text:
-#                             chunks.append(chunk.text)
-#                     explanation = "".join(chunks)
-
-#                     bot_reply_raw = (
-#                         f"Predicted SOH: {soh:.4f}\n"
-#                         f"Battery Status: {status}\n\n"
-#                         f"{explanation}"
-#                     )
-#                     bot_reply = format_bot_text(bot_reply_raw)
-
-#                     # reset state back to normal
-#                     mode = "normal"
-#                     soh_data = {}
-
-#                 except ValueError:
-#                     bot_reply = "Please enter SOE as a numeric value."
-#                     bot_reply = format_bot_text(bot_reply)
-
-#             # 5) Normal chat mode → forward to Gemini
-#             elif mode == "normal":
-#                 contents = [
-#                     types.Content(
-#                         role="user",
-#                         parts=[types.Part(text=user_msg)]
-#                     )
-#                 ]
-#                 chunks = []
-#                 for chunk in client.models.generate_content_stream(
-#                     model=GEMINI_MODEL,
-#                     contents=contents,
-#                     config=types.GenerateContentConfig()
-#                 ):
-#                     if chunk.text:
-#                         chunks.append(chunk.text)
-#                 bot_reply = format_bot_text("".join(chunks))
-
-#             # ---------------------------------
-
-#             if bot_reply:
-#                 history.append(("bot", bot_reply))
-
-#             # store back in session
-#             session["history"] = history
-#             session["mode"] = mode
-#             session["soh_data"] = soh_data
-
-#     return render_template("chat.html", history=history)
 @app.route("/chatbot", methods=["GET", "POST"])
 def chatbot():
-    # simple session-based state
-    if "history" not in session:
-        session["history"] = []
-    if "mode" not in session:
-        session["mode"] = "normal"   # normal / await_voltages / await_soc / await_soe
-    if "soh_data" not in session:
-        session["soh_data"] = {}
+    # Initialize session state
+    history = session.get("history", [])
+    mode = session.get("mode", "normal")
+    soh_data = session.get("soh_data", {})  # to store voltages, soc, soe, threshold
 
-    history = session["history"]
-    mode = session["mode"]
-    soh_data = session["soh_data"]
+    if request.method == "GET":
+        # Reset state when opening the page
+        history = []
+        mode = "normal"
+        soh_data = {}
+        session["history"] = history
+        session["mode"] = mode
+        session["soh_data"] = soh_data
+        return render_template("chat.html", history=history)
+
+    # POST (user sent a message)
+    user_msg = request.form.get("message", "").strip()
+    if not user_msg:
+        return render_template("chat.html", history=history)
+
+    history.append(("user", user_msg))
 
     bot_reply = None
+    lower_msg = user_msg.lower()
 
-    if request.method == "POST":
-        action = request.form.get("action", "send")
+    # -------- Simple intents (help, greetings, cancel, etc.) --------
+    simple_intent = detect_simple_intent(lower_msg)
 
-        # --- Handle "New chat" button ---
-        if action == "reset":
-            history = []
-            mode = "normal"
-            soh_data = {}
-            bot_reply = format_bot_text("Starting a new conversation. How can I help you?")
-            history.append(("bot", bot_reply))
+    if simple_intent == "help":
+        bot_reply = (
+            "I can do two main things:\n"
+            "1. **Check battery SOH** – say something like 'check battery soh' or "
+            "'predict soh', and I'll guide you through entering voltages, SOC and SOE.\n"
+            "2. **Answer general battery questions** – ask me things like "
+            "'how to extend battery life?' and I’ll explain using Gemini."
+        )
+        bot_reply = format_bot_text(bot_reply)
 
-            session["history"] = history
-            session["mode"] = mode
-            session["soh_data"] = soh_data
+    elif simple_intent == "greeting" and mode == "normal":
+        bot_reply = (
+            "Hi! I'm Optimus, your battery health assistant.\n"
+            "You can say **'check battery soh'** to start an SOH check, or "
+            "ask any general battery question."
+        )
+        bot_reply = format_bot_text(bot_reply)
 
-            return render_template("chat.html", history=history)
+    elif simple_intent == "goodbye":
+        bot_reply = "Goodbye! If you need another SOH check later, just come back. 😊"
+        bot_reply = format_bot_text(bot_reply)
+        mode = "normal"
+        soh_data = {}
 
-        # Otherwise, normal send
-        user_msg = request.form.get("message", "").strip()
-        if user_msg:
-            history.append(("user", user_msg))
+    elif simple_intent == "thanks":
+        bot_reply = "You're welcome! Happy to help. ⚡"
+        bot_reply = format_bot_text(bot_reply)
 
-            # ---------- SIMPLE INTENT HANDLING (HELP + SMALL TALK + CANCEL + CORRECTION) ----------
-            intent = detect_simple_intent(user_msg)
+    elif simple_intent == "cancel":
+        bot_reply = (
+            "Okay, I've cancelled the current SOH check.\n"
+            "You can start a new one any time by saying **'check battery soh'**."
+        )
+        bot_reply = format_bot_text(bot_reply)
+        mode = "normal"
+        soh_data = {}
 
-            # CANCEL INTENT
-            if intent == "cancel":
-                # Reset the flow but keep history
-                mode = "normal"
-                soh_data = {}
-                bot_reply = format_bot_text(
-                    "Okay, I’ve cancelled the current SOH check.\n"
-                    "If you'd like to start again, just say **'predict SOH'**."
-                )
+    elif simple_intent == "restart":
+        # Restart the SOH flow from threshold question
+        soh_data = {}
+        mode = "await_threshold"
+        bot_reply = (
+            "No problem, let's restart the SOH check.\n"
+            "The default SOH threshold for a 'healthy' battery is **0.8 (80%)**.\n"
+            "If you'd like a different threshold, enter a number like `0.75`.\n"
+            "Or type `default` to keep 0.8."
+        )
+        bot_reply = format_bot_text(bot_reply)
 
-            # CORRECTION INTENT
-            elif intent == "correction":
-                # Restart SOH flow completely
-                mode = "await_voltages"
-                soh_data = {}
-                bot_reply = format_bot_text(
-                    "No problem — let's restart the SOH check.\n"
-                    "Please enter your 21 voltages again (U1–U21 separated by spaces)."
-                )
-
-            elif intent == "help":
-                #give help statements
-                bot_reply = format_bot_text(
-                    "**Here’s how I can help you:**\n"
-                    "- Predict your battery State of Health (SOH)\n"
-                    "- Explain what SOH, SOC, and SOE mean in simple terms\n"
-                    "- Walk you through entering voltages step by step\n"
-                    "- Chat about battery basics or general questions\n\n"
-                    "If you’d like to check your battery, type something like "
-                    "**'predict SOH'** or **'check battery health'**."
-                )
-
-            elif intent == "greeting":
-                #replies with the greeting statement
-                bot_reply = format_bot_text(
-                    "Hey! 👋\n\n"
-                    "I’m your battery assistant.\n"
-                    "You can say **'predict SOH'** or **'check battery health'** to start a battery health check, "
-                    "or ask **'help'** to see what I can do."
-                )
-
-            elif intent == "goodbye":
-                #rpelies with the bye statements
-                bot_reply = format_bot_text(
-                    "Goodbye! 👋\n"
-                    "Come back anytime you want to check your battery health."
-                )
-
-            elif intent == "thanks":
-                bot_reply = format_bot_text(
-                    "You’re welcome! 😊\n"
-                    "If you want another check later, just say **'predict SOH'**."
-                )
-
-            # If any simple intent produced a reply, send it and SKIP the rest
-            if bot_reply:
-                history.append(("bot", bot_reply))
-                session["history"] = history
-                session["mode"] = mode
-                session["soh_data"] = soh_data
-                return render_template("chat.html", history=history)
-
-            # --------- STATE MACHINE ----------
-            # 1) If in normal mode and user asks for prediction
-            if mode == "normal" and (
-                "predict soh" in user_msg.lower()
-                or "check battery health" in user_msg.lower()
+    # If no simple intent handled it, run the state machine
+    if bot_reply is None:
+        # ---------------- STATE: NORMAL ----------------
+        if mode == "normal":
+            # Start SOH check
+            if any(
+                key in lower_msg
+                for key in [
+                    "check battery soh",
+                    "predict soh",
+                    "battery health",
+                    "soh check",
+                ]
             ):
-                mode = "await_voltages"
+                mode = "await_threshold"
                 soh_data = {}
                 bot_reply = (
-                    "Okay, let's check your battery health.\n"
-                    "Please send 21 cell voltages (U1–U21) in one line, "
-                    "separated by spaces."
+                    "Great, let's check your battery SOH.\n\n"
+                    "The default SOH threshold for a 'healthy' battery is **0.8 (80%)**.\n"
+                    "If you want to use a different threshold, enter a number like `0.75`.\n"
+                    "Or type `default` (or just press enter) to keep 0.8."
                 )
                 bot_reply = format_bot_text(bot_reply)
+            else:
+                # General chat → Gemini
+                prompt = (
+                    "You are a helpful battery and energy storage assistant.\n"
+                    "Answer the following user question clearly and concisely:\n\n"
+                    f"User: {user_msg}"
+                )
+                reply_text = gemini_reply(prompt)
+                bot_reply = format_bot_text(reply_text)
 
-            # 2) Collect voltages
-            elif mode == "await_voltages":
+        # ---------------- STATE: AWAIT_THRESHOLD ----------------
+        elif mode == "await_threshold":
+            text = lower_msg.strip()
+            if text in ["", "default", "keep", "no", "skip"]:
+                threshold = 0.8
+            else:
                 try:
-                    parts = user_msg.split()
-                    U_values = [float(x) for x in parts]
-                    if len(U_values) != 21:
-                        raise ValueError
-                    soh_data["U_values"] = U_values
-                    mode = "await_soc"
-                    bot_reply = "Got the voltages. Now enter SOC (as a number)."
-                    bot_reply = format_bot_text(bot_reply)
+                    threshold = float(user_msg)
                 except ValueError:
                     bot_reply = (
-                        "I couldn't read that as 21 numbers.\n"
-                        "Please enter exactly 21 numeric voltages separated by spaces."
+                        "Please enter a numeric threshold like `0.8` or `0.75`,\n"
+                        "or type `default` to keep 0.8."
                     )
                     bot_reply = format_bot_text(bot_reply)
+                    # stay in await_threshold
+                    history.append(("bot", bot_reply))
+                    session["history"] = history
+                    session["mode"] = mode
+                    session["soh_data"] = soh_data
+                    return render_template("chat.html", history=history)
 
-            # 3) Collect SOC
-            elif mode == "await_soc":
-                try:
-                    soc = float(user_msg)
-                    soh_data["soc"] = soc
-                    mode = "await_soe"
-                    bot_reply = "Thanks. Now enter SOE (as a number)."
-                    bot_reply = format_bot_text(bot_reply)
-                except ValueError:
-                    bot_reply = "Please enter SOC as a numeric value."
-                    bot_reply = format_bot_text(bot_reply)
+            soh_data["threshold"] = threshold
+            mode = "await_voltages"
+            bot_reply = (
+                f"Got it. I'll use **{threshold:.2f}** as the SOH threshold.\n\n"
+                "Now please enter your cell voltages.\n"
+                "You can enter **between 1 and 21** voltages separated by spaces.\n"
+                "- If you enter all 21, I'll use the most accurate model.\n"
+                "- If you enter fewer than 21, I'll use a simplified, less accurate model."
+            )
+            bot_reply = format_bot_text(bot_reply)
 
-            # 4) Collect SOE and run prediction
-            elif mode == "await_soe":
-                try:
-                    soe = float(user_msg)
-                    soh_data["soe"] = soe
+        # ---------------- STATE: AWAIT_VOLTAGES ----------------
+        elif mode == "await_voltages":
+            try:
+                parts = user_msg.split()
+                U_values = [float(x) for x in parts]
 
-                    U_values = soh_data["U_values"]
-                    soc = soh_data["soc"]
+                if len(U_values) == 0 or len(U_values) > 21:
+                    raise ValueError
 
-                    soh = predict_soh(U_values, soc, soe)
-                    status = "Healthy" if soh >= 0.8 else "Has a Problem"
+                soh_data["U_values"] = U_values
+                mode = "await_soc"
 
-                    # Ask Gemini to explain the result
+                if len(U_values) == 21:
+                    msg = (
+                        "Great, I got all **21 voltages**.\n"
+                        "Now please enter **SOC** as a number (e.g., `50` for 50%)."
+                    )
+                else:
+                    msg = (
+                        f"Thanks, I received **{len(U_values)}** voltages.\n"
+                        "I'll use a simplified model based on their average, "
+                        "so this prediction will be **less accurate**.\n\n"
+                        "Now please enter **SOC** as a number (e.g., `50` for 50%)."
+                    )
+
+                bot_reply = format_bot_text(msg)
+
+            except ValueError:
+                msg = (
+                    "I couldn't read that correctly.\n"
+                    "Please enter **between 1 and 21 numeric voltages** separated by spaces."
+                )
+                bot_reply = format_bot_text(msg)
+
+        # ---------------- STATE: AWAIT_SOC ----------------
+        elif mode == "await_soc":
+            try:
+                soc = float(user_msg)
+                soh_data["soc"] = soc
+                mode = "await_soe"
+                msg = "Got it. Now please enter **SOE** as a number."
+                bot_reply = format_bot_text(msg)
+            except ValueError:
+                msg = "Please enter SOC as a numeric value (e.g., `50` for 50%)."
+                bot_reply = format_bot_text(msg)
+
+        # ---------------- STATE: AWAIT_SOE ----------------
+        elif mode == "await_soe":
+            try:
+                soe = float(user_msg)
+                soh_data["soe"] = soe
+
+                U_values = soh_data.get("U_values", [])
+                soc = soh_data.get("soc")
+                threshold = soh_data.get("threshold", 0.8)
+
+                soh, used_fallback = predict_soh(U_values, soc, soe)
+                status = "Healthy" if soh >= threshold else "Has a Problem"
+
+                # Explanation prompt
+                if used_fallback:
                     explanation_prompt = (
                         f"The predicted battery SOH is {soh:.4f} and the status is '{status}'. "
+                        "The prediction was made using a simplified model that only had access "
+                        "to the **average** of a partial set of voltages plus SOC and SOE, "
+                        "so it is less accurate than the full model. "
+                        "Explain what this means in simple terms for a non-expert user, and "
+                        "mention that the result is approximate because not all voltages were provided."
+                    )
+                else:
+                    explanation_prompt = (
+                        f"The predicted battery SOH is {soh:.4f} and the status is '{status}'. "
+                        "The prediction was made using all 21 cell voltages plus SOC and SOE. "
                         "Explain what this means in simple terms for a non-expert user."
                     )
-                    contents = [
-                        types.Content(
-                            role="user",
-                            parts=[types.Part(text=explanation_prompt)]
-                        )
-                    ]
 
-                    chunks = []
-                    for chunk in client.models.generate_content_stream(
-                        model=GEMINI_MODEL,
-                        contents=contents,
-                        config=types.GenerateContentConfig()
-                    ):
-                        if chunk.text:
-                            chunks.append(chunk.text)
-                    explanation = "".join(chunks)
+                explanation = gemini_reply(explanation_prompt)
 
-                    bot_reply_raw = (
-                        f"Predicted SOH: {soh:.4f}\n"
-                        f"Battery Status: {status}\n\n"
-                        f"{explanation}"
-                    )
-                    bot_reply = format_bot_text(bot_reply_raw)
+                msg = (
+                    f"**Predicted SOH:** {soh:.4f}\n"
+                    f"**Battery Status:** {status}\n"
+                    f"**Threshold Used:** {threshold:.2f}\n\n"
+                    f"{explanation}"
+                )
 
-                    # reset state back to normal
-                    mode = "normal"
-                    soh_data = {}
+                bot_reply = format_bot_text(msg)
 
-                except ValueError:
-                    bot_reply = "Please enter SOE as a numeric value."
-                    bot_reply = format_bot_text(bot_reply)
+                # Reset back to normal chat mode
+                mode = "normal"
+                soh_data = {}
 
-            # 5) Normal chat mode → forward to Gemini
-            elif mode == "normal":
-                contents = [
-                    types.Content(
-                        role="user",
-                        parts=[types.Part(text=user_msg)]
-                    )
-                ]
-                chunks = []
-                for chunk in client.models.generate_content_stream(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                    config=types.GenerateContentConfig()
-                ):
-                    if chunk.text:
-                        chunks.append(chunk.text)
-                bot_reply = format_bot_text("".join(chunks))
+            except ValueError:
+                msg = "Please enter SOE as a numeric value."
+                bot_reply = format_bot_text(msg)
 
-            # ---------------------------------
+        else:
+            # Safety fallback
+            mode = "normal"
+            soh_data = {}
+            msg = (
+                "Something went wrong with the conversation state, "
+                "so I reset the SOH check.\n"
+                "You can start again by saying **'check battery soh'**."
+            )
+            bot_reply = format_bot_text(msg)
 
-            if bot_reply:
-                history.append(("bot", bot_reply))
+    # Store state back in session
+    if bot_reply:
+        history.append(("bot", bot_reply))
 
-            # store back in session
-            session["history"] = history
-            session["mode"] = mode
-            session["soh_data"] = soh_data
+    session["history"] = history
+    session["mode"] = mode
+    session["soh_data"] = soh_data
 
     return render_template("chat.html", history=history)
 
 
+# ---------------------------
+# Main entrypoint
+# ---------------------------
+
 if __name__ == "__main__":
     print("\nFlask server running!")
-    print("Manual SOH form → http://127.0.0.1:5000/")
-    print("Chatbot UI      → http://127.0.0.1:5000/chatbot\n")
+    print("Manual SOH form -> http://127.0.0.1:5000/")
+    print("Chatbot UI      -> http://127.0.0.1:5000/chatbot\n")
 
     app.run(debug=True, use_reloader=False)
-
